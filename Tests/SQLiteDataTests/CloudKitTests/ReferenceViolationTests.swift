@@ -408,6 +408,88 @@
           }
         }
       }
+
+      // A reference violation for a parent that has NEVER been uploaded is an
+      // upload-ordering problem, not a remote deletion. The child must
+      // survive, and both records must be re-queued so a later batch settles
+      // the ordering.
+      //
+      // Any bulk insert produces this — thousands of records queue at once
+      // with no ordering guarantee between parents and children — and
+      // deleting the child destroys data the user still has.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func referenceViolation_ParentNeverUploaded_KeepsChildAndRetries() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+
+        // Hold the parent back so the child is sent on its own — what the
+        // engine does naturally when a bulk insert spans several batches.
+        syncEngine.private.state.remove(
+          pendingRecordZoneChanges: [.saveRecord(RemindersList.recordID(for: 1))]
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        // The child survived. Before this behavior existed it was
+        // cascade-deleted right here, while its parent sat waiting to upload.
+        try await userDatabase.read { db in
+          try #expect(Reminder.find(1).fetchCount(db) == 1)
+          try #expect(RemindersList.find(1).fetchCount(db) == 1)
+        }
+
+        // Draining the re-queued changes uploads the parent and lands the
+        // child behind it.
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.read { db in
+          try #expect(
+            Reminder.all.fetchAll(db) == [
+              Reminder(id: 1, title: "Get milk", remindersListID: 1)
+            ]
+          )
+          try #expect(
+            RemindersList.all.fetchAll(db) == [
+              RemindersList(id: 1, title: "Personal")
+            ]
+          )
+        }
+        assertInlineSnapshot(of: container, as: .customDump) {
+          """
+          MockCloudContainer(
+            privateCloudDatabase: MockCloudDatabase(
+              databaseScope: .private,
+              storage: [
+                [0]: CKRecord(
+                  recordID: CKRecord.ID(1:reminders/zone/__defaultOwner__),
+                  recordType: "reminders",
+                  parent: CKReference(recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__)),
+                  share: nil,
+                  id: 1,
+                  isCompleted: 0,
+                  remindersListID: 1,
+                  title: "Get milk"
+                ),
+                [1]: CKRecord(
+                  recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__),
+                  recordType: "remindersLists",
+                  parent: nil,
+                  share: nil,
+                  id: 1,
+                  title: "Personal"
+                )
+              ]
+            ),
+            sharedCloudDatabase: MockCloudDatabase(
+              databaseScope: .shared,
+              storage: []
+            )
+          )
+          """
+        }
+      }
     }
   }
 #endif

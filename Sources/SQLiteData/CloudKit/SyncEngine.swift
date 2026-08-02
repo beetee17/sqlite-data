@@ -1710,6 +1710,36 @@
           else {
             continue
           }
+
+          // A reference violation says only that the server has no parent
+          // record. There are two very different reasons for that:
+          //
+          //   * The parent was on the server and something deleted it.
+          //     Converging means applying the foreign key action locally,
+          //     which is what the code below does.
+          //   * The parent has never been uploaded, because this batch
+          //     carried a child ahead of its parent. Nothing is wrong with
+          //     the data at all.
+          //
+          // Only the first warrants touching local rows. Treating the second
+          // as a deletion destroys records the user still has, and it is not
+          // an edge case: any bulk insert — an import, a restore, a first
+          // sync — queues thousands of records at once with no ordering
+          // guarantee between parents and children.
+          //
+          // The discriminator is whether the parent has a last-known server
+          // record. Note that "does the parent row still exist locally" will
+          // NOT do: when a remote deletion has been sent but not yet fetched,
+          // the parent is still present locally, and re-queueing it there
+          // would resurrect a record the remote deliberately deleted.
+          if let parentRecordID = failedRecord.parent?.recordID,
+            await !parentWasEverUploaded(parentRecordID)
+          {
+            newPendingRecordZoneChanges.append(.saveRecord(parentRecordID))
+            newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+            continue
+          }
+
           func open<T>(_: some SynchronizableTable<T>) async throws {
             try await userDatabase.write { db in
               try $_isSynchronizingChanges.withValue(false) {
@@ -1894,6 +1924,29 @@
             $0.share = #bind(nil)
           }
           .execute(db)
+      }
+    }
+
+    /// Whether a record has ever been accepted by the server, per its
+    /// last-known server record.
+    ///
+    /// Distinguishes a parent that was deleted remotely (uploaded once, so
+    /// this is `true`) from one that has simply not been sent yet (`false`).
+    /// Defaults to `true` when the answer cannot be determined, which keeps
+    /// callers on their previous, more conservative path.
+    private func parentWasEverUploaded(_ recordID: CKRecord.ID) async -> Bool {
+      do {
+        let hasServerRecord: Bool? = try await metadatabase.read { db in
+          try SyncMetadata
+            .find(recordID)
+            .select(\.hasLastKnownServerRecord)
+            .fetchOne(db)
+        }
+        // No metadata row at all also means it was never uploaded.
+        return hasServerRecord ?? false
+      } catch {
+        // Undeterminable: stay on the previous, conservative path.
+        return true
       }
     }
 
