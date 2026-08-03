@@ -922,6 +922,35 @@
       $isSynchronizing
     }
 
+    package struct ZoneFetchProgress: Sendable {
+      var completed = 0
+      var total = 0
+    }
+    package let zoneFetchProgress = LockIsolated(ZoneFetchProgress())
+
+    /// Derives the current activity and hands it to the delegate.
+    ///
+    /// Send wins over fetch when both are in flight: it is the phase the user
+    /// is actually waiting on, and the one that produces visible results.
+    private func reportSyncActivity() async {
+      guard let delegate else { return }
+      let progress = zoneFetchProgress.value
+      let sending = await MainActor.run { sendingChangesCount > 0 }
+      let fetching = await MainActor.run { fetchingChangesCount > 0 }
+
+      let activity: SyncActivity =
+        if sending {
+          .sendingChanges
+        } else if fetching {
+          progress.total > 0
+            ? .fetchingZoneChanges(completed: progress.completed, total: progress.total)
+            : .fetchingDatabaseChanges
+        } else {
+          .idle
+        }
+      await delegate.syncEngine(self, syncActivityChanged: activity)
+    }
+
     private var sendingChangesCount: Int {
       get {
         observationRegistrar.access(self, keyPath: \.isSendingChanges)
@@ -1008,6 +1037,13 @@
       case .stateUpdate(let stateSerialization):
         await handleStateUpdate(stateSerialization: stateSerialization, syncEngine: syncEngine)
       case .fetchedDatabaseChanges(let modifications, let deletions):
+        // The zone list that is about to be fetched — the only place a
+        // denominator for the fetch phase exists.
+        zoneFetchProgress.withValue {
+          $0.total = modifications.count
+          $0.completed = 0
+        }
+        await reportSyncActivity()
         await handleFetchedDatabaseChanges(
           modifications: modifications,
           deletions: deletions,
@@ -1039,28 +1075,37 @@
         await MainActor.run {
           fetchingChangesCount += 1
         }
+        await reportSyncActivity()
       case .didFetchRecordZoneChanges:
         await MainActor.run {
           fetchingChangesCount -= 1
         }
+        zoneFetchProgress.withValue { $0.completed += 1 }
+        await reportSyncActivity()
 
       case .willFetchChanges:
         await MainActor.run {
           fetchingChangesCount += 1
         }
+        zoneFetchProgress.setValue(ZoneFetchProgress())
+        await reportSyncActivity()
       case .didFetchChanges:
         await MainActor.run {
           fetchingChangesCount -= 1
         }
+        zoneFetchProgress.setValue(ZoneFetchProgress())
+        await reportSyncActivity()
 
       case .willSendChanges:
         await MainActor.run {
           sendingChangesCount += 1
         }
+        await reportSyncActivity()
       case .didSendChanges:
         await MainActor.run {
           sendingChangesCount -= 1
         }
+        await reportSyncActivity()
 
       @unknown default:
         break
