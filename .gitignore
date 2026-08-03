@@ -8,3 +8,8 @@ DerivedData/
 *.orig
 *.sqlite
 *.xcresult
+
+# Test-run artifacts from the CloudKit suite
+sqlitedata_icloud
+sqlitedata_icloud-shm
+sqlitedata_icloud-wal
