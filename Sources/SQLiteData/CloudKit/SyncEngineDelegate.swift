@@ -79,10 +79,56 @@
       _ syncEngine: SyncEngine,
       accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
     ) async
+
+    /// The engine's current sync activity, reported as it changes.
+    ///
+    /// `CKSyncEngine` completes a full fetch pass across every zone in the
+    /// database before it sends anything. On an account carrying many zones
+    /// that pass can run for minutes, during which nothing observable moves:
+    /// `isSynchronizing` is merely `true`, and no record has been accepted by
+    /// the server yet, so an app showing upload progress is pinned at zero
+    /// with nothing to say about why.
+    ///
+    /// This reports the phase, and during the fetch a zone count — the
+    /// denominator arrives with `fetchedDatabaseChanges`, which enumerates
+    /// the zones about to be fetched — so an app can distinguish "preparing"
+    /// from "stuck" and show real movement.
+    ///
+    /// Called on every transition. The default implementation does nothing.
+    func syncEngine(
+      _ syncEngine: SyncEngine,
+      syncActivityChanged activity: SyncEngine.SyncActivity
+    ) async
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  extension SyncEngine {
+    /// What the engine is doing right now, for progress reporting.
+    public enum SyncActivity: Equatable, Sendable {
+      case idle
+      /// Enumerating which zones have changes; no denominator yet.
+      case fetchingDatabaseChanges
+      /// Fetching per-zone changes. `total` is the zone count reported by
+      /// `fetchedDatabaseChanges`; `completed` counts those finished.
+      case fetchingZoneChanges(completed: Int, total: Int)
+      case sendingChanges
+
+      /// 0...1 where a denominator exists, else nil.
+      public var fractionCompleted: Double? {
+        guard case .fetchingZoneChanges(let completed, let total) = self, total > 0
+        else { return nil }
+        return min(1, Double(completed) / Double(total))
+      }
+    }
   }
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   extension SyncEngineDelegate {
+    public func syncEngine(
+      _ syncEngine: SyncEngine,
+      syncActivityChanged activity: SyncEngine.SyncActivity
+    ) async {}
+
     public func syncEngine(
       _ syncEngine: SyncEngine,
       accountChanged changeType: CKSyncEngine.Event.AccountChange.ChangeType
