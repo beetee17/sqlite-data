@@ -1016,6 +1016,27 @@
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   extension SyncEngine: CKSyncEngineDelegate {
+    /// Forwards to the app's delegate so it can narrow the fetch scope.
+    ///
+    /// Unimplemented, this returns the context's options and the engine walks
+    /// every zone in the database — including zones the app does not own and
+    /// whose records it will discard. See `SyncEngineDelegate`.
+    ///
+    /// **The name has to be exactly this.** `CKSyncEngineDelegate` declares
+    /// `nextFetchChangesOptions(_:syncEngine:)` and supplies a default
+    /// implementation, so a near-miss spelling — `syncEngine(_:fetchChangesOptions:)`,
+    /// say — compiles cleanly, satisfies nothing, and is never called. The
+    /// app's scope is then silently ignored and every fetch walks the whole
+    /// database. Verified against the SDK: there is no `fetchChangesOptions`
+    /// symbol in the protocol.
+    public func nextFetchChangesOptions(
+      _ context: CKSyncEngine.FetchChangesContext,
+      syncEngine: CKSyncEngine
+    ) async -> CKSyncEngine.FetchChangesOptions {
+      guard let delegate else { return context.options }
+      return await delegate.syncEngine(self, fetchChangesOptions: context)
+    }
+
     public func handleEvent(_ event: CKSyncEngine.Event, syncEngine: CKSyncEngine) async {
       guard let event = Event(event)
       else {
