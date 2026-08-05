@@ -99,6 +99,28 @@
       _ syncEngine: SyncEngine,
       syncActivityChanged activity: SyncEngine.SyncActivity
     ) async
+
+    /// The options to use for the next fetch, so an app can narrow what the
+    /// engine walks.
+    ///
+    /// `CKSyncEngine` is scoped to a *database*, not a zone, and by default
+    /// fetches every zone in it. That is the right default, but it is wrong
+    /// for an app whose database also contains zones written by something
+    /// else — most commonly an `NSPersistentCloudKitContainer` mirroring the
+    /// same app's previous storage, whose `com.apple.coredata.cloudkit.*`
+    /// zones can outnumber the app's own by an order of magnitude. Those
+    /// zones are fetched in full on every pass, and their records are then
+    /// discarded here because no table claims their record types.
+    ///
+    /// Returning `context.options` unchanged preserves the default
+    /// behaviour, which is what the default implementation does.
+    ///
+    /// Called between server requests while fetching, so it can react to
+    /// state that changes mid-pass.
+    func syncEngine(
+      _ syncEngine: SyncEngine,
+      fetchChangesOptions context: CKSyncEngine.FetchChangesContext
+    ) async -> CKSyncEngine.FetchChangesOptions
   }
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
@@ -128,6 +150,13 @@
       _ syncEngine: SyncEngine,
       syncActivityChanged activity: SyncEngine.SyncActivity
     ) async {}
+
+    public func syncEngine(
+      _ syncEngine: SyncEngine,
+      fetchChangesOptions context: CKSyncEngine.FetchChangesContext
+    ) async -> CKSyncEngine.FetchChangesOptions {
+      context.options
+    }
 
     public func syncEngine(
       _ syncEngine: SyncEngine,
