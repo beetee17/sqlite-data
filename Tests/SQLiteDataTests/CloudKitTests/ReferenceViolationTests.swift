@@ -573,6 +573,80 @@
         }
       }
 
+      // The cross-batch shape, and the one that survived both earlier fixes.
+      //
+      // The parent is queued in one batch and the child violates in a later
+      // one, so the same-batch check cannot see the parent at all and the
+      // discriminator is asked. It answered "uploaded" — because building a
+      // record for sending calls `refreshLastKnownServerRecord` on it, so the
+      // metadata gets a `lastKnownServerRecord` at *queue* time, before the
+      // server has seen anything. 22 sub-todos deleted on a real migration
+      // while their parents sat waiting to upload.
+      //
+      // Hence `wasAcceptedByServer`: only CloudKit issues a change tag, so a
+      // locally-built record has none no matter what else is populated.
+      //
+      // Building the batch and discarding it is exactly what production did —
+      // there the send came back `operationCancelled`, which re-queues nothing
+      // and leaves the stamped metadata behind.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func referenceViolation_ParentQueuedButNeverAccepted_KeepsChild() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+
+        let engine = syncEngine.syncEngine(for: .private)
+        let batch = try #require(
+          await engine.parentSyncEngine.nextRecordZoneChangeBatch(syncEngine: engine)
+        )
+        let reminderRecord = try #require(
+          batch.recordsToSave.first { $0.recordID == Reminder.recordID(for: 1) }
+        )
+
+        // Nothing was sent: the server is still empty, yet the parent's
+        // metadata has now been stamped by the act of queueing it.
+        #expect(
+          engine.database.state.withValue { $0.storage.values.allSatisfy { $0.records.isEmpty } }
+        )
+
+        // The parent is absent from this response — it was cancelled in the
+        // earlier batch — so only the discriminator can save the child.
+        await engine.parentSyncEngine.handleEvent(
+          .sentRecordZoneChanges(
+            savedRecords: [],
+            failedRecordSaves: [
+              (record: reminderRecord, error: CKError(.referenceViolation))
+            ],
+            deletedRecordIDs: [],
+            failedRecordDeletes: [:]
+          ),
+          syncEngine: engine
+        )
+
+        try await userDatabase.read { db in
+          try #expect(Reminder.find(1).fetchCount(db) == 1)
+          try #expect(RemindersList.find(1).fetchCount(db) == 1)
+        }
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.read { db in
+          try #expect(
+            Reminder.all.fetchAll(db) == [
+              Reminder(id: 1, title: "Get milk", remindersListID: 1)
+            ]
+          )
+          try #expect(
+            RemindersList.all.fetchAll(db) == [
+              RemindersList(id: 1, title: "Personal")
+            ]
+          )
+        }
+      }
+
       @Test func referenceViolation_ParentNeverUploaded_KeepsChildAndRetries() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {

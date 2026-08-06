@@ -379,6 +379,24 @@
       get { self[#function] }
       set { self[#function] = newValue }
     }
+
+    /// Whether the server has ever handed this record back, from a save or a
+    /// fetch.
+    ///
+    /// A change tag is assigned by CloudKit and by nothing else, which makes it
+    /// the one honest answer to "has this been uploaded". A record built
+    /// locally to be sent has none, however thoroughly its other fields are
+    /// populated — and note that a non-`nil` `lastKnownServerRecord` is *not*
+    /// the same question, since that column is written the moment a record is
+    /// queued.
+    ///
+    /// Both tags are consulted because `MockCloudDatabase` cannot set the real
+    /// one — `recordChangeTag` is readonly and server-assigned, so the mock
+    /// stands in `_recordChangeTag`, and every test would otherwise read as
+    /// "never uploaded".
+    public var wasAcceptedByServer: Bool {
+      recordChangeTag != nil || _recordChangeTag != nil
+    }
   }
 
   extension DataProtocol {
