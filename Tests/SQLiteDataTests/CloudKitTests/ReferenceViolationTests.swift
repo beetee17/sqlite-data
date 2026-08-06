@@ -497,6 +497,82 @@
         }
       }
 
+      // The second same-batch shape, and the one that survived the first fix.
+      //
+      // CloudKit fails a batch as a unit: when one record in the request
+      // errors, the rest come back `operationCancelled`. So a parent can be
+      // in the same response as its rejected child and be in
+      // `failedRecordSaves` rather than `savedRecords` — emphatically not on
+      // the server, which is exactly why the child violated. Checking only
+      // `savedRecords` misses it and falls through to the destructive branch:
+      // 86 children deleted on a real migration, every parent merely
+      // cancelled.
+      //
+      // The parent is synced first here so it has a last-known server record.
+      // That is what makes the test bite: without the fix the same-batch check
+      // misses, `parentWasEverUploaded` answers `true`, and the child is
+      // deleted as a remote deletion.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func referenceViolation_ParentCancelledInSameBatch_KeepsChildAndRetries()
+        async throws
+      {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        let listRecordID = RemindersList.recordID(for: 1)
+        let reminderRecordID = Reminder.recordID(for: 1)
+        let engine = syncEngine.syncEngine(for: .private)
+        let records = engine.database.state.withValue { state in
+          (
+            list: state.storage[listRecordID.zoneID]?.records[listRecordID],
+            reminder: state.storage[reminderRecordID.zoneID]?.records[reminderRecordID]
+          )
+        }
+        let listRecord = try #require(records.list)
+        let reminderRecord = try #require(records.reminder)
+
+        await engine.parentSyncEngine.handleEvent(
+          .sentRecordZoneChanges(
+            savedRecords: [],
+            failedRecordSaves: [
+              (record: reminderRecord, error: CKError(.referenceViolation)),
+              (record: listRecord, error: CKError(.operationCancelled)),
+            ],
+            deletedRecordIDs: [],
+            failedRecordDeletes: [:]
+          ),
+          syncEngine: engine
+        )
+
+        try await userDatabase.read { db in
+          try #expect(Reminder.find(1).fetchCount(db) == 1)
+          try #expect(RemindersList.find(1).fetchCount(db) == 1)
+        }
+
+        // Both were re-queued by the child's branch — note that
+        // `operationCancelled` re-queues nothing on its own, so the parent
+        // getting back in line is entirely the guard's doing.
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.read { db in
+          try #expect(
+            Reminder.all.fetchAll(db) == [
+              Reminder(id: 1, title: "Get milk", remindersListID: 1)
+            ]
+          )
+          try #expect(
+            RemindersList.all.fetchAll(db) == [
+              RemindersList(id: 1, title: "Personal")
+            ]
+          )
+        }
+      }
+
       @Test func referenceViolation_ParentNeverUploaded_KeepsChildAndRetries() async throws {
         try await userDatabase.userWrite { db in
           try db.seed {
