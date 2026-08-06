@@ -1730,7 +1730,14 @@
       // reference-violation guard has to judge failures against the state as
       // it was when the server processed this batch — not against state this
       // function has since produced. See the `.referenceViolation` case.
-      let savedInThisBatch = Set(savedRecords.map(\.recordID))
+      //
+      // Both halves of the response count. A parent that failed alongside its
+      // child is just as "not on the server yet" as one that succeeded
+      // alongside it — more so — and CloudKit fails an entire batch together,
+      // so a parent cancelled by a sibling's error (`operationCancelled`)
+      // lands here rather than in `savedRecords`.
+      let sentInThisBatch = Set(savedRecords.map(\.recordID))
+        .union(failedRecordSaves.map(\.record.recordID))
 
       for savedRecord in savedRecords {
         await refreshLastKnownServerRecord(savedRecord)
@@ -1804,28 +1811,36 @@
           // NOT do: when a remote deletion has been sent but not yet fetched,
           // the parent is still present locally, and re-queueing it there
           // would resurrect a record the remote deliberately deleted.
-          // A parent saved in *this* batch does not count as "was ever
-          // uploaded" for a child that failed in the same response.
+          // A parent that appears anywhere in *this* batch does not count as
+          // "was ever uploaded" for a child that failed in the same response.
           //
           // CloudKit does not order a batch internally, so it can process the
-          // child before the parent and return both together: the child
-          // failed with a reference violation, the parent succeeded. The loop
-          // above has already written the parent's last-known server record by
-          // the time this runs, so asking the metadatabase reports `true` and
-          // the child is read as "parent deleted remotely" — the destructive
-          // branch — when in fact the parent had simply not landed yet.
+          // child before the parent and return both together. Two shapes of
+          // that have been observed on real migrations:
+          //
+          //   * The parent succeeded. The loop above has already written its
+          //     last-known server record by the time this runs, so asking the
+          //     metadatabase reports `true` and the child is read as "parent
+          //     deleted remotely" — the destructive branch — when the parent
+          //     had simply not landed yet. (158 sub-todo violations, 79 rows
+          //     deleted, every parent present on the server moments later.)
+          //   * The parent failed too, with `operationCancelled`, because a
+          //     sibling in the batch errored and CloudKit abandoned the rest.
+          //     It is emphatically not on the server, yet the destructive
+          //     branch still ran for all 86 of its children — which is why
+          //     `sentInThisBatch` covers failures as well as saves.
           //
           // That is precisely the bulk-insert case this guard exists for, and
-          // it was the one case it got backwards. Observed on a real migration:
-          // 158 sub-todo reference violations, 79 of them deleted locally,
-          // every parent present on the server moments later.
+          // it was the one case it got backwards.
           let parentRecordID = failedRecord.parent?.recordID
           // Split rather than `||`ed: `await` may not appear to the right of a
           // non-assignment operator, and short-circuiting matters — the
           // same-batch check is free, the metadatabase read is not.
           var parentIsPending = false
+          var parentSentInThisBatch = false
           if let parentRecordID {
-            if savedInThisBatch.contains(parentRecordID) {
+            parentSentInThisBatch = sentInThisBatch.contains(parentRecordID)
+            if parentSentInThisBatch {
               parentIsPending = true
             } else {
               parentIsPending = await !parentWasEverUploaded(parentRecordID)
@@ -1838,7 +1853,7 @@
               applying the foreign key locally \
               (child: \(failedRecord.recordID.recordName, privacy: .public), \
               parent: \(parentRecordID.recordName, privacy: .public), \
-              parentSavedInThisBatch: \(savedInThisBatch.contains(parentRecordID), privacy: .public))
+              parentSentInThisBatch: \(parentSentInThisBatch, privacy: .public))
               """
             )
             newPendingRecordZoneChanges.append(.saveRecord(parentRecordID))
@@ -2051,8 +2066,16 @@
     ///
     /// Distinguishes a parent that was deleted remotely (uploaded once, so
     /// this is `true`) from one that has simply not been sent yet (`false`).
-    /// Defaults to `true` when the answer cannot be determined, which keeps
-    /// callers on their previous, more conservative path.
+    ///
+    /// Answers `false` when the answer cannot be determined. The caller's
+    /// `true` branch deletes local rows, so an undeterminable answer must not
+    /// select it: re-queueing a parent that was in fact deleted remotely costs
+    /// one redundant upload, which the next fetch corrects, while deleting on a
+    /// failed read costs the user their data.
+    ///
+    /// Each of the three outcomes is logged distinctly. The branch taken here
+    /// decides whether rows get deleted, and it has been guessed at from the
+    /// outside twice; the log should say which one ran.
     private func parentWasEverUploaded(_ recordID: CKRecord.ID) async -> Bool {
       do {
         let hasServerRecord: Bool? = try await metadatabase.read { db in
@@ -2061,11 +2084,23 @@
             .select(\.hasLastKnownServerRecord)
             .fetchOne(db)
         }
+        logger.debug(
+          """
+          parentWasEverUploaded(\(recordID.recordName, privacy: .public)): \
+          \(hasServerRecord.map(String.init(describing:)) ?? "no metadata row", privacy: .public)
+          """
+        )
         // No metadata row at all also means it was never uploaded.
         return hasServerRecord ?? false
       } catch {
-        // Undeterminable: stay on the previous, conservative path.
-        return true
+        logger.error(
+          """
+          parentWasEverUploaded(\(recordID.recordName, privacy: .public)): \
+          read failed, treating as never uploaded — \
+          \(error.localizedDescription, privacy: .public)
+          """
+        )
+        return false
       }
     }
 
