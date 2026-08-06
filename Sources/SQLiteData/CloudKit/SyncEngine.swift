@@ -2067,31 +2067,47 @@
     /// Distinguishes a parent that was deleted remotely (uploaded once, so
     /// this is `true`) from one that has simply not been sent yet (`false`).
     ///
+    /// Note what this does *not* ask. `hasLastKnownServerRecord` is the
+    /// obvious-looking discriminator and it is the wrong one:
+    /// `refreshLastKnownServerRecord` is called from
+    /// `nextRecordZoneChangeBatch` on the record it has just built, so the
+    /// column is populated when a row is *queued*, long before the server has
+    /// seen it. It means "we have a record for this row", not "the server took
+    /// it". Asking it cost 22 sub-todos on a real migration — every parent
+    /// merely queued, cancelled, and still waiting to upload.
+    ///
+    /// A change tag does mean that. CloudKit assigns it, so it is `nil` on a
+    /// locally-built `CKRecord` and non-`nil` on anything the server handed
+    /// back — from a save or a fetch alike — and `encodeSystemFields` carries
+    /// it through the metadata blob.
+    ///
     /// Answers `false` when the answer cannot be determined. The caller's
     /// `true` branch deletes local rows, so an undeterminable answer must not
     /// select it: re-queueing a parent that was in fact deleted remotely costs
     /// one redundant upload, which the next fetch corrects, while deleting on a
     /// failed read costs the user their data.
     ///
-    /// Each of the three outcomes is logged distinctly. The branch taken here
-    /// decides whether rows get deleted, and it has been guessed at from the
-    /// outside twice; the log should say which one ran.
+    /// Each outcome is logged distinctly. The branch taken here decides whether
+    /// rows get deleted, and it has been guessed at from the outside twice; the
+    /// log should say which one ran.
     private func parentWasEverUploaded(_ recordID: CKRecord.ID) async -> Bool {
       do {
-        let hasServerRecord: Bool? = try await metadatabase.read { db in
+        let lastKnownServerRecord: CKRecord? = try await metadatabase.read { db in
           try SyncMetadata
             .find(recordID)
-            .select(\.hasLastKnownServerRecord)
+            .select(\.lastKnownServerRecord)
             .fetchOne(db)
+            ?? nil
         }
+        let wasAccepted = lastKnownServerRecord?.wasAcceptedByServer ?? false
         logger.debug(
           """
           parentWasEverUploaded(\(recordID.recordName, privacy: .public)): \
-          \(hasServerRecord.map(String.init(describing:)) ?? "no metadata row", privacy: .public)
+          \(wasAccepted, privacy: .public) \
+          (\(lastKnownServerRecord == nil ? "no record in metadata" : "record present", privacy: .public))
           """
         )
-        // No metadata row at all also means it was never uploaded.
-        return hasServerRecord ?? false
+        return wasAccepted
       } catch {
         logger.error(
           """
