@@ -1727,6 +1727,12 @@
       failedRecordDeletes: [CKRecord.ID: CKError] = [:],
       syncEngine: any SyncEngineProtocol
     ) async {
+      // Recorded *before* the loop below writes anything, because the
+      // reference-violation guard has to judge failures against the state as
+      // it was when the server processed this batch — not against state this
+      // function has since produced. See the `.referenceViolation` case.
+      let savedInThisBatch = Set(savedRecords.map(\.recordID))
+
       for savedRecord in savedRecords {
         await refreshLastKnownServerRecord(savedRecord)
       }
@@ -1799,13 +1805,60 @@
           // NOT do: when a remote deletion has been sent but not yet fetched,
           // the parent is still present locally, and re-queueing it there
           // would resurrect a record the remote deliberately deleted.
-          if let parentRecordID = failedRecord.parent?.recordID,
-            await !parentWasEverUploaded(parentRecordID)
-          {
+          // A parent saved in *this* batch does not count as "was ever
+          // uploaded" for a child that failed in the same response.
+          //
+          // CloudKit does not order a batch internally, so it can process the
+          // child before the parent and return both together: the child
+          // failed with a reference violation, the parent succeeded. The loop
+          // above has already written the parent's last-known server record by
+          // the time this runs, so asking the metadatabase reports `true` and
+          // the child is read as "parent deleted remotely" — the destructive
+          // branch — when in fact the parent had simply not landed yet.
+          //
+          // That is precisely the bulk-insert case this guard exists for, and
+          // it was the one case it got backwards. Observed on a real migration:
+          // 158 sub-todo reference violations, 79 of them deleted locally,
+          // every parent present on the server moments later.
+          let parentRecordID = failedRecord.parent?.recordID
+          // Split rather than `||`ed: `await` may not appear to the right of a
+          // non-assignment operator, and short-circuiting matters — the
+          // same-batch check is free, the metadatabase read is not.
+          var parentIsPending = false
+          if let parentRecordID {
+            if savedInThisBatch.contains(parentRecordID) {
+              parentIsPending = true
+            } else {
+              parentIsPending = await !parentWasEverUploaded(parentRecordID)
+            }
+          }
+          if let parentRecordID, parentIsPending {
+            logger.debug(
+              """
+              referenceViolation: re-queueing parent then child rather than \
+              applying the foreign key locally \
+              (child: \(failedRecord.recordID.recordName, privacy: .public), \
+              parent: \(parentRecordID.recordName, privacy: .public), \
+              parentSavedInThisBatch: \(savedInThisBatch.contains(parentRecordID), privacy: .public))
+              """
+            )
             newPendingRecordZoneChanges.append(.saveRecord(parentRecordID))
             newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
             continue
           }
+
+          // Falling through here deletes local rows. It should only ever
+          // happen for a parent that genuinely existed on the server and was
+          // deleted there; say so out loud, because the last time this was
+          // wrong it cost 79 rows and was invisible.
+          logger.error(
+            """
+            referenceViolation: applying the foreign key action LOCALLY for \
+            \(failedRecord.recordID.recordName, privacy: .public) — parent \
+            \(failedRecord.parent?.recordID.recordName ?? "<none>", privacy: .public) \
+            was uploaded previously and is now absent from the server
+            """
+          )
 
           func open<T>(_: some SynchronizableTable<T>) async throws {
             try await userDatabase.write { db in
