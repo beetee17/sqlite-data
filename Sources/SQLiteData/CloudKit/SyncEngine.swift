@@ -1242,6 +1242,18 @@
 
         guard let table = tablesByName[metadata.recordType]
         else {
+          // Dropping a pending change means this row will never reach the
+          // server, and its children will violate against it for as long as
+          // both exist. That was previously a `#if DEBUG` breadcrumb in an
+          // in-memory array, so an exported log showed a record type simply
+          // never being sent, with nothing to say why. Say it out loud.
+          logger.error(
+            """
+            nextRecordZoneChangeBatch: dropping \
+            \(recordID.recordName, privacy: .public) — no table registered for \
+            record type '\(metadata.recordType, privacy: .public)'
+            """
+          )
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
           missingTable = recordID
           return nil
@@ -1265,6 +1277,17 @@
             ?? nil
           guard let row
           else {
+            // Same again: metadata says this row should sync and the row is
+            // not there. Usually benign — a delete that raced the batch — but
+            // indistinguishable in a log from a record the engine simply never
+            // offered, which is the shape of a campaign that cannot converge.
+            logger.error(
+              """
+              nextRecordZoneChangeBatch: dropping \
+              \(recordID.recordName, privacy: .public) — no row in \
+              '\(metadata.recordType, privacy: .public)' for its primary key
+              """
+            )
             syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
             missingRecord = recordID
             return nil
@@ -2101,11 +2124,21 @@
             ?? nil
         }
         let wasAccepted = lastKnownServerRecord?.wasAcceptedByServer ?? false
+        // "no server record" covers two very different states — no metadata
+        // row at all, and a metadata row for something never uploaded — and
+        // the earlier wording ("no record in metadata") read as the first
+        // while usually meaning the second. Distinguish them: one is a
+        // bookkeeping fault, the other is an ordinary not-yet-sent parent.
+        let detail: String
+        if lastKnownServerRecord != nil {
+          detail = wasAccepted ? "server record, change tag set" : "server record, no change tag"
+        } else {
+          detail = "no server record — never uploaded, or no metadata row"
+        }
         logger.debug(
           """
           parentWasEverUploaded(\(recordID.recordName, privacy: .public)): \
-          \(wasAccepted, privacy: .public) \
-          (\(lastKnownServerRecord == nil ? "no record in metadata" : "record present", privacy: .public))
+          \(wasAccepted, privacy: .public) (\(detail, privacy: .public))
           """
         )
         return wasAccepted
