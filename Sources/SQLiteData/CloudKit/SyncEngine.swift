@@ -381,6 +381,37 @@
       }
     }
 
+    /// Re-queues every record CloudKit has never accepted, and describes what
+    /// it re-queued.
+    ///
+    /// A record whose metadata carries no last-known server record has never
+    /// been accepted by CloudKit. Normally something is already queued to send
+    /// it. When nothing is — because a pending change was dropped, or a save
+    /// failed with an error the engine does not retry — the row is stranded:
+    /// the pending set is the only thing a later launch replays, so nothing
+    /// will ever send it, and locally it looks indistinguishable from a record
+    /// that synced long ago.
+    ///
+    /// This runs automatically on sign-in, where "no server record" can only
+    /// mean "never had the chance". It is deliberately **not** automatic at
+    /// other times, because that same condition also covers records a save
+    /// attempt already failed on, and the engine cannot tell a server that
+    /// refused a record from a network that dropped it. Retrying the first on
+    /// every launch is a loop that never converges. Call this when something
+    /// has established that upload has genuinely stalled — an idle engine with
+    /// work outstanding — rather than on a timer.
+    ///
+    /// Rows awaiting a delete of their own are left alone, and counted
+    /// separately in the report.
+    ///
+    /// The returned ``SyncEngine/UnacceptedRecordsReport`` names the records by
+    /// type, so a caller can log what was retried and compare it against what
+    /// later lands. The library logs the same summary.
+    @discardableResult
+    public func retryRecordsNeverAcceptedByCloudKit() async throws -> UnacceptedRecordsReport {
+      try await enqueueRecordsNeverAcceptedByCloudKit()
+    }
+
     /// Starts the sync engine if it is stopped.
     ///
     /// When a sync engine is started it will upload all data stored locally that has not yet
@@ -663,15 +694,106 @@
       }
     }
 
+    /// Re-queues every record whose metadata says CloudKit has no server
+    /// record for it.
+    ///
+    /// Cheap, SQL-only, and correct at sign-in, where nothing local has had a
+    /// chance to upload yet. It is *not* the same set as
+    /// ``enqueueRecordsNeverAcceptedByCloudKit`` — see there.
     private func enqueueUnknownRecordsForCloudKit() async throws {
       try await userDatabase.write { db in
         try $_isSynchronizingChanges.withValue(false) {
           try SyncMetadata
-            .where { !$0.hasLastKnownServerRecord }
+            .where { !$0.hasLastKnownServerRecord && !$0._isDeleted }
             .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
             .execute(db)
         }
       }
+    }
+
+    /// Re-queues every record CloudKit has never *accepted*.
+    ///
+    /// Acceptance is the change tag CloudKit issues, not the presence of a
+    /// stashed record, and the difference is the whole point of this method.
+    /// `hasLastKnownServerRecord` is the cheap SQL test and it is the wrong
+    /// one: a stashed record with no change tag is a record the server never
+    /// took. Which of the two sets a stalled store actually contains has been
+    /// read both ways from the same evidence, so this targets the superset —
+    /// the exact complement of "done" as callers count it — and is therefore
+    /// right under either reading.
+    ///
+    /// Acceptance is not expressible in SQL, hence the fetch-then-filter, and
+    /// it reads `_lastKnownServerRecordAllFields` rather than
+    /// `lastKnownServerRecord`: the all-fields archive is the one that
+    /// survives a round trip through `MockCloudDatabase`, which cannot set a
+    /// real change tag.
+    ///
+    /// The touch is on `SyncMetadata`, not on the user's row, so no
+    /// `userModificationTime` moves and a re-queued record cannot win a future
+    /// field-level conflict against a genuine edit.
+    private func enqueueRecordsNeverAcceptedByCloudKit() async throws
+      -> UnacceptedRecordsReport
+    {
+      let rows = try await metadatabase.read { db in
+        try SyncMetadata
+          .select { ($0.recordName, $0.recordType, $0._isDeleted, $0._lastKnownServerRecordAllFields)
+          }
+          .fetchAll(db)
+      }
+      var recordNamesByRecordType: [String: [String]] = [:]
+      var skippedSoftDeletedCount = 0
+      for (recordName, recordType, isDeleted, allFields) in rows {
+        guard allFields?.wasAcceptedByServer != true
+        else { continue }
+        if isDeleted {
+          // Soft-deleted rows are skipped. A touch leaves `_isDeleted`
+          // unchanged, which is the condition on the metadata update trigger,
+          // so it fires `didUpdate` and queues a save for a record the user
+          // deleted. That save resurrects nothing — both triggers that set
+          // `_isDeleted` fire when the row leaves under that primary key, so
+          // the batch finds no local row and drops the change — but it is a
+          // wasted change and a "Missing record" warning per deleted row, in
+          // the log this repair exists to make readable.
+          skippedSoftDeletedCount += 1
+        } else {
+          recordNamesByRecordType[recordType, default: []].append(recordName)
+        }
+      }
+      let report = UnacceptedRecordsReport(
+        recordNamesByRecordType: recordNamesByRecordType,
+        skippedSoftDeletedCount: skippedSoftDeletedCount
+      )
+      guard !report.isEmpty
+      else {
+        logger.info(
+          """
+          retryRecordsNeverAcceptedByCloudKit: \(report.logDescription, privacy: .public)
+          """
+        )
+        return report
+      }
+
+      logger.error(
+        """
+        retryRecordsNeverAcceptedByCloudKit: \(report.logDescription, privacy: .public)
+        """
+      )
+      let recordNames = recordNamesByRecordType.values.flatMap { $0 }
+      try await userDatabase.write { db in
+        try $_isSynchronizingChanges.withValue(false) {
+          // Chunked: a stalled migration can strand thousands of rows, and
+          // SQLite has a ceiling on bound parameters per statement.
+          let chunkSize = 500
+          for start in stride(from: 0, to: recordNames.count, by: chunkSize) {
+            let chunk = Array(recordNames[start..<min(start + chunkSize, recordNames.count)])
+            try SyncMetadata
+              .where { $0.recordName.in(chunk) }
+              .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
+              .execute(db)
+          }
+        }
+      }
+      return report
     }
 
     private func uploadRecordsToCloudKit<T>(
@@ -2392,6 +2514,76 @@
         !recordPrimaryKeyBytes.isEmpty
       else { return nil }
       return String(Substring(recordPrimaryKeyBytes))
+    }
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  extension SyncEngine {
+    /// What ``SyncEngine/retryRecordsNeverAcceptedByCloudKit()`` re-queued.
+    ///
+    /// Records are grouped by type rather than reduced to a count, because a
+    /// stall that is one record type is a different fault from a stall spread
+    /// evenly across the store — the first points at that type's schema or its
+    /// parent, the second at the campaign. A bare number cannot tell them
+    /// apart, and by the time the retry succeeds the evidence is gone.
+    public struct UnacceptedRecordsReport: Sendable, Equatable {
+      /// The record names re-queued, keyed by record type.
+      public let recordNamesByRecordType: [String: [String]]
+
+      /// How many rows were skipped because they are soft-deleted and awaiting
+      /// a delete of their own. Reported rather than hidden: a large number
+      /// here means deletes are backing up, which looks identical to a stalled
+      /// upload from the outside.
+      public let skippedSoftDeletedCount: Int
+
+      /// The number of records re-queued.
+      public var count: Int {
+        recordNamesByRecordType.values.reduce(0) { $0 + $1.count }
+      }
+
+      public var isEmpty: Bool { count == 0 }
+
+      /// The record types re-queued, most records first.
+      public var recordTypesByFrequency: [(recordType: String, count: Int)] {
+        recordNamesByRecordType
+          .map { (recordType: $0.key, count: $0.value.count) }
+          .sorted { ($0.count, $1.recordType) > ($1.count, $0.recordType) }
+      }
+
+      /// A one-line summary for a log: per-type counts, then a sample of names.
+      ///
+      /// The sample is capped. Naming a few records is what makes a report
+      /// checkable against the server afterwards; naming four thousand only
+      /// makes the log unreadable.
+      public func logDescription(sampleLimit: Int = 10) -> String {
+        guard !isEmpty
+        else {
+          return skippedSoftDeletedCount > 0
+            ? "nothing to retry (\(skippedSoftDeletedCount) soft-deleted row(s) skipped)"
+            : "nothing to retry"
+        }
+        let byType =
+          recordTypesByFrequency
+          .map { "\($0.recordType): \($0.count)" }
+          .joined(separator: ", ")
+        let sample =
+          recordNamesByRecordType
+          .values
+          .flatMap { $0 }
+          .sorted()
+          .prefix(sampleLimit)
+          .joined(separator: ", ")
+        let elided = count > sampleLimit ? ", …+\(count - sampleLimit) more" : ""
+        let skipped =
+          skippedSoftDeletedCount > 0
+          ? " (skipped \(skippedSoftDeletedCount) soft-deleted)"
+          : ""
+        return "re-queued \(count) record(s) never accepted by CloudKit\(skipped) — "
+          + "\(byType) — \(sample)\(elided)"
+      }
+
+      /// The default log summary.
+      public var logDescription: String { logDescription() }
     }
   }
 
