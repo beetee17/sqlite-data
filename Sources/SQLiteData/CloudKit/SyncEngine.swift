@@ -1197,19 +1197,32 @@
       #endif
 
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
-        guard
-          let (metadata, allFields) = await withErrorReporting(
-            .sqliteDataCloudKitFailure,
-            catching: {
-              try await metadatabase.read { db in
-                try SyncMetadata
-                  .find(recordID)
-                  .select { ($0, $0._lastKnownServerRecordAllFields) }
-                  .fetchOne(db)
-              }
-            }
+        // `withErrorReporting` collapses a thrown read and an empty result into
+        // the same nil, so this has to be an explicit do/catch: a failure to
+        // *ask* is not an answer. Treating it as one dropped the pending change,
+        // and that drop is permanent — the pending set is the only thing a later
+        // launch replays. That is how a row ends up stamped as queued, absent
+        // from the server, and never retried again.
+        let found: (SyncMetadata, CKRecord?)?
+        do {
+          found = try await metadatabase.read { db in
+            try SyncMetadata
+              .find(recordID)
+              .select { ($0, $0._lastKnownServerRecordAllFields) }
+              .fetchOne(db)
+          }
+        } catch {
+          logger.error(
+            """
+            nextRecordZoneChangeBatch(\(recordID.recordName, privacy: .public)): \
+            metadata read failed, leaving change pending — \
+            \(error.localizedDescription, privacy: .public)
+            """
           )
-            ?? nil
+          reportIssue(error, .sqliteDataCloudKitFailure)
+          return nil
+        }
+        guard let (metadata, allFields) = found
         else {
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
           return nil

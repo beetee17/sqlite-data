@@ -20,6 +20,60 @@
       final class SyncEngineLifecycleTests_ImmediatelyStarted: BaseCloudKitTests,
         @unchecked Sendable
       {
+        // A record CloudKit never accepted, with nothing queued to send it, is
+        // stranded: the pending set is the only thing a later launch replays.
+        // This is the state a dropped pending change leaves behind, and the
+        // account that prompted this relaunched four times without retrying.
+        // Starting the engine must re-queue it.
+        @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+        @Test func strandedRecordIsRequeuedOnStart() async throws {
+          try await userDatabase.userWrite { db in
+            try db.seed {
+              RemindersList(id: 1, title: "Personal")
+            }
+          }
+
+          // Strand it: the row exists and has no server record, but every trace
+          // of the outstanding work is gone — from the engine's state and from
+          // the durable table that repopulates it.
+          syncEngine.private.state.remove(
+            pendingRecordZoneChanges: [.saveRecord(RemindersList.recordID(for: 1))]
+          )
+          #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+          syncEngine.stop()
+          try await userDatabase.write { db in
+            try PendingRecordZoneChange.delete().execute(db)
+          }
+
+          try await syncEngine.start()
+          try await syncEngine.processPendingDatabaseChanges(scope: .private)
+          try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+          assertInlineSnapshot(of: container, as: .customDump) {
+            """
+            MockCloudContainer(
+              privateCloudDatabase: MockCloudDatabase(
+                databaseScope: .private,
+                storage: [
+                  [0]: CKRecord(
+                    recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__),
+                    recordType: "remindersLists",
+                    parent: nil,
+                    share: nil,
+                    id: 1,
+                    title: "Personal"
+                  )
+                ]
+              ),
+              sharedCloudDatabase: MockCloudDatabase(
+                databaseScope: .shared,
+                storage: []
+              )
+            )
+            """
+          }
+        }
+
         @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
         @Test func stopAndReStart() async throws {
           syncEngine.stop()
