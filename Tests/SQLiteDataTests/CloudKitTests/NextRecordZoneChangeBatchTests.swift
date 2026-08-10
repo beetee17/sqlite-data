@@ -35,6 +35,104 @@
         }
       }
 
+      // A *failed* metadata read is not the same as an absent metadata row.
+      // `noMetadataForRecord` above covers the absent row: there is genuinely
+      // nothing to send, so dropping the pending change is correct. Here the
+      // row exists and the read itself fails, so dropping the change strands
+      // the record permanently — the pending set is the only thing a later
+      // launch replays, and no retry is ever scheduled.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func failedMetadataReadKeepsChangePending() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+          }
+        }
+        #expect(
+          syncEngine.private.state.pendingRecordZoneChanges == [
+            .saveRecord(RemindersList.recordID(for: 1))
+          ]
+        )
+
+        // Take the metadata table offline to simulate a transient read failure.
+        // `legacy_alter_table` keeps SQLite from rewriting trigger bodies, so
+        // the rename is a pure, reversible outage.
+        try await takeMetadataTableOffline()
+        try await withKnownIssue {
+          try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        } matching: {
+          $0.description.contains("no such table")
+        }
+
+        // Nothing reached the server...
+        #expect(throws: (any Error).self) {
+          try syncEngine.private.database.record(for: RemindersList.recordID(for: 1))
+        }
+        // ...so the change must still be pending. Before the fix this was empty:
+        // the failed read was read as "this record does not exist" and the only
+        // record of the outstanding work was thrown away.
+        #expect(
+          syncEngine.private.state.pendingRecordZoneChanges == [
+            .saveRecord(RemindersList.recordID(for: 1))
+          ]
+        )
+
+        // And once the database recovers, the record uploads on the next pass
+        // with no further user edit to prompt it.
+        try await bringMetadataTableBackOnline()
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        assertInlineSnapshot(of: container, as: .customDump) {
+          """
+          MockCloudContainer(
+            privateCloudDatabase: MockCloudDatabase(
+              databaseScope: .private,
+              storage: [
+                [0]: CKRecord(
+                  recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__),
+                  recordType: "remindersLists",
+                  parent: nil,
+                  share: nil,
+                  id: 1,
+                  title: "Personal"
+                )
+              ]
+            ),
+            sharedCloudDatabase: MockCloudDatabase(
+              databaseScope: .shared,
+              storage: []
+            )
+          )
+          """
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      private func takeMetadataTableOffline() async throws {
+        try await syncEngine.metadatabase.write { db in
+          try db.execute(sql: "PRAGMA legacy_alter_table = ON")
+          try db.execute(
+            sql: """
+              ALTER TABLE "sqlitedata_icloud_metadata" RENAME TO "sqlitedata_icloud_metadata_offline"
+              """
+          )
+          try db.execute(sql: "PRAGMA legacy_alter_table = OFF")
+        }
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      private func bringMetadataTableBackOnline() async throws {
+        try await syncEngine.metadatabase.write { db in
+          try db.execute(sql: "PRAGMA legacy_alter_table = ON")
+          try db.execute(
+            sql: """
+              ALTER TABLE "sqlitedata_icloud_metadata_offline" RENAME TO "sqlitedata_icloud_metadata"
+              """
+          )
+          try db.execute(sql: "PRAGMA legacy_alter_table = OFF")
+        }
+      }
+
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func nonExistentTable() async throws {
         try await userDatabase.userWrite { db in
