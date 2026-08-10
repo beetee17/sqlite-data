@@ -626,6 +626,12 @@
       previousRecordTypeByTableName: [String: RecordType],
       currentRecordTypeByTableName: [String: RecordType]
     ) async throws {
+      // Order matters. The touch writes durable pending rows through the
+      // metadata triggers; `enqueueLocallyPendingChanges` then loads them into
+      // the engine's state, and only after that is the durable table cleared.
+      // Repairing after the drain would leave the rows sitting in a table
+      // nothing reads until the *next* launch.
+      try await enqueueUnacceptedRecordsForCloudKit()
       try await enqueueLocallyPendingChanges()
       try await userDatabase.write { db in
         try PendingRecordZoneChange.delete().execute(db)
@@ -638,6 +644,55 @@
           for tableName in newTableNames {
             try self.uploadRecordsToCloudKit(tableName: tableName, db: db)
           }
+        }
+      }
+    }
+
+    /// Re-queues rows the engine believes it sent but the server never
+    /// acknowledged.
+    ///
+    /// `enqueueUnknownRecordsForCloudKit` already repairs rows that were never
+    /// queued (`!hasLastKnownServerRecord`). It cannot see the other way a row
+    /// goes missing: `lastKnownServerRecord` is stamped when a record is
+    /// *queued*, so a change dropped between queueing and acknowledgement
+    /// leaves a row that looks sent, is absent from the server, and is in
+    /// nobody's pending set. The durable queue is the only thing a later launch
+    /// replays, so once the change is gone the row is stranded permanently — an
+    /// account observed this way sat at 3895 of 3908 across four launches with
+    /// no error logged, because from every local vantage point it looked done.
+    ///
+    /// Acceptance is not expressible in SQL — it is the change tag on the
+    /// archived `CKRecord` — hence the fetch-then-filter. The touch is on
+    /// `SyncMetadata`, not on the user's row, so no `userModificationTime` is
+    /// disturbed and the repair cannot win a future field-level conflict.
+    private func enqueueUnacceptedRecordsForCloudKit() async throws {
+      // Soft-deleted rows must be excluded. Touching one leaves `_isDeleted`
+      // unchanged, which is exactly the condition on the metadata update
+      // trigger, so the touch would fire `didUpdate` and re-queue a *save* for
+      // a record the user deleted — resurrecting it locally and on the server.
+      let strandedKeys: [String] = try await metadatabase.read { db in
+        try SyncMetadata
+          .where { $0.hasLastKnownServerRecord && !$0._isDeleted }
+          .fetchAll(db)
+          .lazy
+          .filter { $0.lastKnownServerRecord?.wasAcceptedByServer != true }
+          .map(\.recordPrimaryKey)
+      }
+      guard !strandedKeys.isEmpty else { return }
+
+      logger.error(
+        """
+        enqueueUnacceptedRecordsForCloudKit: re-queueing \
+        \(strandedKeys.count, privacy: .public) record(s) stamped as queued that \
+        the server never acknowledged
+        """
+      )
+      try await userDatabase.write { db in
+        try $_isSynchronizingChanges.withValue(false) {
+          try SyncMetadata
+            .where { $0.recordPrimaryKey.in(strandedKeys) }
+            .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
+            .execute(db)
         }
       }
     }
@@ -1196,19 +1251,32 @@
       #endif
 
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
-        guard
-          let (metadata, allFields) = await withErrorReporting(
-            .sqliteDataCloudKitFailure,
-            catching: {
-              try await metadatabase.read { db in
-                try SyncMetadata
-                  .find(recordID)
-                  .select { ($0, $0._lastKnownServerRecordAllFields) }
-                  .fetchOne(db)
-              }
-            }
+        // `withErrorReporting` collapses a thrown read and an empty result into
+        // the same nil, so this has to be an explicit do/catch: a failure to
+        // *ask* is not an answer. Treating it as one dropped the pending change,
+        // and that drop is permanent — the pending set is the only thing a later
+        // launch replays. That is how a row ends up stamped as queued, absent
+        // from the server, and never retried again.
+        let found: (SyncMetadata, CKRecord?)?
+        do {
+          found = try await metadatabase.read { db in
+            try SyncMetadata
+              .find(recordID)
+              .select { ($0, $0._lastKnownServerRecordAllFields) }
+              .fetchOne(db)
+          }
+        } catch {
+          logger.error(
+            """
+            nextRecordZoneChangeBatch(\(recordID.recordName, privacy: .public)): \
+            metadata read failed, leaving change pending — \
+            \(error.localizedDescription, privacy: .public)
+            """
           )
-            ?? nil
+          reportIssue(error, .sqliteDataCloudKitFailure)
+          return nil
+        }
+        guard let (metadata, allFields) = found
         else {
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
           return nil
@@ -1241,6 +1309,18 @@
 
         guard let table = tablesByName[metadata.recordType]
         else {
+          // Dropping a pending change means this row will never reach the
+          // server, and its children will violate against it for as long as
+          // both exist. That was previously a `#if DEBUG` breadcrumb in an
+          // in-memory array, so an exported log showed a record type simply
+          // never being sent, with nothing to say why. Say it out loud.
+          logger.error(
+            """
+            nextRecordZoneChangeBatch: dropping \
+            \(recordID.recordName, privacy: .public) — no table registered for \
+            record type '\(metadata.recordType, privacy: .public)'
+            """
+          )
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
           missingTable = recordID
           return nil
@@ -1264,6 +1344,17 @@
             ?? nil
           guard let row
           else {
+            // Same again: metadata says this row should sync and the row is
+            // not there. Usually benign — a delete that raced the batch — but
+            // indistinguishable in a log from a record the engine simply never
+            // offered, which is the shape of a campaign that cannot converge.
+            logger.error(
+              """
+              nextRecordZoneChangeBatch: dropping \
+              \(recordID.recordName, privacy: .public) — no row in \
+              '\(metadata.recordType, privacy: .public)' for its primary key
+              """
+            )
             syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
             missingRecord = recordID
             return nil
@@ -2100,11 +2191,21 @@
             ?? nil
         }
         let wasAccepted = lastKnownServerRecord?.wasAcceptedByServer ?? false
+        // "no server record" covers two very different states — no metadata
+        // row at all, and a metadata row for something never uploaded — and
+        // the earlier wording ("no record in metadata") read as the first
+        // while usually meaning the second. Distinguish them: one is a
+        // bookkeeping fault, the other is an ordinary not-yet-sent parent.
+        let detail: String
+        if lastKnownServerRecord != nil {
+          detail = wasAccepted ? "server record, change tag set" : "server record, no change tag"
+        } else {
+          detail = "no server record — never uploaded, or no metadata row"
+        }
         logger.debug(
           """
           parentWasEverUploaded(\(recordID.recordName, privacy: .public)): \
-          \(wasAccepted, privacy: .public) \
-          (\(lastKnownServerRecord == nil ? "no record in metadata" : "record present", privacy: .public))
+          \(wasAccepted, privacy: .public) (\(detail, privacy: .public))
           """
         )
         return wasAccepted
