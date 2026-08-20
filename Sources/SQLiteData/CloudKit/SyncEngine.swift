@@ -2175,6 +2175,15 @@
       if enqueuedUnsyncedRecordID {
         await handleFetchedRecordZoneChanges(syncEngine: syncEngine)
       }
+
+      // Reported last, once this batch's re-queueing is scheduled, so a
+      // delegate that reacts by rate limiting its own CloudKit work is not
+      // racing the engine's recovery. The engine needs no help retrying;
+      // the app does need to know the account's limiter is closed, because
+      // it shares one with every other path it writes through.
+      if !failedRecordSaves.isEmpty, let delegate {
+        await delegate.syncEngine(self, didFailToSendRecords: failedRecordSaves)
+      }
     }
 
     private func cacheShare(_ share: CKShare) async throws {

@@ -94,6 +94,35 @@
     /// the zones about to be fetched — so an app can distinguish "preparing"
     /// from "stuck" and show real movement.
     ///
+    /// Records the server refused, with the error it refused them for.
+    ///
+    /// `CKSyncEngine` handles its own retries, so the engine does not need
+    /// the app's help here — but the *app* frequently needs to know. An app
+    /// that also writes to CloudKit outside the engine (its own metadata
+    /// records, a `NSPersistentCloudKitContainer` mirror it is migrating
+    /// away from, telemetry) shares one account-scoped rate limiter with it,
+    /// and those paths have no other way to learn that the limiter is
+    /// already closed.
+    ///
+    /// Without this the asymmetry is stark: the engine sends thousands of
+    /// records and absorbs every `requestRateLimited` privately, while a
+    /// caller writing three records sees the one refusal it earns itself. An
+    /// app throttling itself on that evidence is calibrating against the
+    /// smallest signal available and piling on with the largest.
+    ///
+    /// Failures arrive per batch, so a single throttled send reports every
+    /// record in it — 250 at a time is typical. Callers that only want to
+    /// know *whether* they were throttled should look at the first error
+    /// rather than iterate.
+    ///
+    /// Called after the engine has finished reacting to the batch, so the
+    /// re-queueing it does is already scheduled. The default implementation
+    /// does nothing.
+    func syncEngine(
+      _ syncEngine: SyncEngine,
+      didFailToSendRecords failures: [(record: CKRecord, error: CKError)]
+    ) async
+
     /// Called on every transition. The default implementation does nothing.
     func syncEngine(
       _ syncEngine: SyncEngine,
@@ -146,6 +175,11 @@
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   extension SyncEngineDelegate {
+    public func syncEngine(
+      _ syncEngine: SyncEngine,
+      didFailToSendRecords failures: [(record: CKRecord, error: CKError)]
+    ) async {}
+
     public func syncEngine(
       _ syncEngine: SyncEngine,
       syncActivityChanged activity: SyncEngine.SyncActivity
