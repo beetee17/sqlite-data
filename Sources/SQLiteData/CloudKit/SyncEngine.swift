@@ -1316,9 +1316,41 @@
       options: CKSyncEngine.SendChangesOptions = CKSyncEngine.SendChangesOptions(scope: .all),
       syncEngine: any SyncEngineProtocol
     ) async -> CKSyncEngine.RecordZoneChangeBatch? {
+      let stateChangeCount = syncEngine.state.pendingRecordZoneChanges.count
       var changes = await pendingRecordZoneChanges(options: options, syncEngine: syncEngine)
       guard !changes.isEmpty
       else { return nil }
+
+      // What survived the scope filter, and what the sort put at the front.
+      //
+      // The batch's own table says what the *resolver* did with each change,
+      // but says nothing about changes that never reached it. On a stuck
+      // migration that was the whole question: 2,331 changes sat in
+      // `state.pendingRecordZoneChanges` — 76 areas and 63 projects among
+      // them — and every batch came back containing only todos, with no
+      // "Missing table"/"Missing record" rows to explain the rest. That
+      // leaves exactly two candidates, the scope filter and the sort, and
+      // neither was observable.
+      //
+      // Composition rather than a total: the ordering is the point. Parents
+      // must lead, and "1,350 todos" tells you nothing about whether the 76
+      // areas are at the front, at the back, or gone.
+      func composition(_ list: [CKSyncEngine.PendingRecordZoneChange]) -> String {
+        var counts: [String: Int] = [:]
+        for change in list {
+          let name: String? =
+            switch change {
+            case .saveRecord(let id): id.tableName
+            case .deleteRecord(let id): id.tableName
+            @unknown default: nil
+            }
+          counts[name ?? "<unresolved>", default: 0] += 1
+        }
+        return counts.sorted { $0.value > $1.value }
+          .map { "\($0.key)=\($0.value)" }
+          .joined(separator: " ")
+      }
+      let filteredComposition = composition(changes)
 
       changes.sort { lhs, rhs in
         switch (lhs, rhs) {
@@ -1346,6 +1378,14 @@
           return true
         }
       }
+
+      logger.info(
+        """
+        nextRecordZoneChangeBatch: state=\(stateChangeCount, privacy: .public) \
+        afterScope=\(changes.count, privacy: .public) [\(filteredComposition, privacy: .public)] \
+        sortedHead=[\(composition(Array(changes.prefix(20))), privacy: .public)]
+        """
+      )
 
       #if DEBUG
         let state = LockIsolated(NextRecordZoneChangeBatchLoggingState())
