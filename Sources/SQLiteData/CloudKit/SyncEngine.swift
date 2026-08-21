@@ -779,7 +779,30 @@
         """
       )
       let recordNames = recordNamesByRecordType.values.flatMap { $0 }
-      try await userDatabase.write { db in
+
+      // Counted off `CKSyncEngine.State`, not off the `PendingRecordZoneChange`
+      // table.
+      //
+      // Those are two different queues and only one of them is the answer
+      // here. `didUpdate` writes to the table only when the engine is
+      // *stopped* — it is the durable spool `enqueueLocallyPendingChanges()`
+      // replays at start. While the engine is running, which is always the
+      // case during a repair, it calls `state.add(pendingRecordZoneChanges:)`
+      // instead, and that is also what `nextRecordZoneChangeBatch` consumes.
+      //
+      // Reading the table here returns 0 before and 0 after whether or not
+      // the repair enqueued anything, which is worse than no instrumentation:
+      // it looks like a definitive negative result.
+      func statePendingCount() -> Int {
+        syncEngines.withValue { engines in
+          (engines.private?.state.pendingRecordZoneChanges.count ?? 0)
+            + (engines.shared?.state.pendingRecordZoneChanges.count ?? 0)
+        }
+      }
+      let pendingBefore = statePendingCount()
+
+      let rowsUpdated = try await userDatabase.write { db -> Int in
+        var updated = 0
         try $_isSynchronizingChanges.withValue(false) {
           // Chunked: a stalled migration can strand thousands of rows, and
           // SQLite has a ceiling on bound parameters per statement.
@@ -790,9 +813,31 @@
               .where { $0.recordName.in(chunk) }
               .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
               .execute(db)
+            updated += db.changesCount
           }
         }
+        return updated
       }
+
+      // Rows the UPDATE actually matched, not the number of names handed to
+      // it. A `WHERE recordName IN (...)` that matches nothing and one that
+      // matches everything produce the same report otherwise, and the report
+      // is what a stuck migration is read from.
+      //
+      // Seen in the field: all 76 areas and 63 projects refused once for rate
+      // limiting, and thereafter present in no batch at all — not in
+      // `nextRecordZoneChangeBatch`, not in `sentRecordZoneChanges` — while
+      // this repair reported them as re-queued on every launch. Every child
+      // of those parents then failed `referenceViolation` indefinitely,
+      // because the parent record it names is not on the server.
+      let pendingAfter = statePendingCount()
+      logger.info(
+        """
+        retryRecordsNeverAcceptedByCloudKit: \(recordNames.count, privacy: .public) name(s) -> \
+        \(rowsUpdated, privacy: .public) row(s) updated; \
+        state pending \(pendingBefore, privacy: .public) -> \(pendingAfter, privacy: .public)
+        """
+      )
       return report
     }
 
