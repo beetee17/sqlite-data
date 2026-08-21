@@ -1352,32 +1352,23 @@
       }
       let filteredComposition = composition(changes)
 
-      changes.sort { lhs, rhs in
-        switch (lhs, rhs) {
-        case (.saveRecord(let lhs), .saveRecord(let rhs)):
-          guard
-            let lhsRecordType = lhs.tableName,
-            let lhsIndex = tablesByOrder[lhsRecordType],
-            let rhsRecordType = rhs.tableName,
-            let rhsIndex = tablesByOrder[rhsRecordType]
-          else { return true }
-          return lhsIndex < rhsIndex
-        case (.deleteRecord(let lhs), .deleteRecord(let rhs)):
-          guard
-            let lhsRecordType = lhs.tableName,
-            let lhsIndex = tablesByOrder[lhsRecordType],
-            let rhsRecordType = rhs.tableName,
-            let rhsIndex = tablesByOrder[rhsRecordType]
-          else { return true }
-          return lhsIndex > rhsIndex
-        case (.saveRecord, .deleteRecord):
-          return false
-        case (.deleteRecord, .saveRecord):
-          return true
-        default:
-          return true
-        }
-      }
+      // `sort(by:)` requires a strict weak ordering, and the predicate this
+      // replaced was not one: when either table could not be resolved it
+      // answered `true`, so for an unresolvable `r` and any `a` both
+      // `cmp(r, a)` and `cmp(a, r)` were true. Swift leaves the result of the
+      // *entire* sort unspecified in that case, not merely the pairs
+      // involved, and a real migration hit exactly that — thirteen records of
+      // a table absent from `tablesByOrder` put 1,350 todos ahead of the 76
+      // areas they reference, every todo failed `referenceViolation` against
+      // a parent that was consequently never sent, and the campaign
+      // deadlocked across ten launches.
+      //
+      // `topologicallyAscending` is total: an unresolved table takes `.max`
+      // for saves and `.min` for deletes (unknown last, either way), equal
+      // indices tie-break on the table name, and `nil` is handled explicitly
+      // rather than by a catch-all. Deferring to it also means one definition
+      // of the ordering rather than two that can drift.
+      changes.sort(by: pendingChangeIsAscending)
 
       logger.info(
         """
@@ -1942,7 +1933,52 @@
       }
     }
 
-    private func topologicallyAscending(
+    /// A total order over table names, so `sort(by:)` has the strict weak
+    /// ordering it requires.
+    ///
+    /// `package` so the ordering itself can be tested. Asserting it through a
+    /// sorted batch is indirect and unreliable — an invalid predicate leaves
+    /// the result *unspecified*, so a test can pass on luck. The property
+    /// worth pinning is asymmetry, and that has to be asked directly.
+    /// The order a batch of pending changes is sent in.
+    ///
+    /// A named function rather than a closure inside
+    /// `nextRecordZoneChangeBatch` so it can be tested directly. It has to
+    /// be: `sort(by:)` leaves the result *unspecified* when its predicate is
+    /// not a strict weak ordering, so asserting on a sorted batch cannot
+    /// prove the predicate is sound — at any given size and input
+    /// permutation a broken one may produce the right answer by luck, and
+    /// the version this replaced did exactly that in tests while
+    /// deadlocking a real account.
+    package func pendingChangeIsAscending(
+      _ lhs: CKSyncEngine.PendingRecordZoneChange,
+      _ rhs: CKSyncEngine.PendingRecordZoneChange
+    ) -> Bool {
+      switch (lhs, rhs) {
+      case (.saveRecord(let lhs), .saveRecord(let rhs)):
+        // Parents first: a child CloudKit rejects for a missing parent is
+        // only recoverable if the parent is already on its way.
+        return topologicallyAscending(
+          lhsTableName: lhs.tableName, rhsTableName: rhs.tableName, rootFirst: true
+        )
+      case (.deleteRecord(let lhs), .deleteRecord(let rhs)):
+        // Children first, for the mirror-image reason.
+        return topologicallyAscending(
+          lhsTableName: lhs.tableName, rhsTableName: rhs.tableName, rootFirst: false
+        )
+      case (.saveRecord, .deleteRecord):
+        return false
+      case (.deleteRecord, .saveRecord):
+        return true
+      @unknown default:
+        // `false` means "no opinion", which is always a legal answer. The
+        // `true` that used to be here was the same asymmetry bug a second
+        // time: two values of a future case compared true in both directions.
+        return false
+      }
+    }
+
+    package func topologicallyAscending(
       lhsTableName: String?,
       rhsTableName: String?,
       rootFirst: Bool
@@ -2589,7 +2625,7 @@
   }
 
   extension CKRecord.ID {
-    var tableName: String? {
+    package var tableName: String? {
       guard
         let i = recordName.utf8.lastIndex(of: UTF8.CodeUnit(ascii: ":")),
         let j = recordName.utf8.index(i, offsetBy: 1, limitedBy: recordName.utf8.endIndex)
@@ -2973,7 +3009,27 @@
     var visited = Set<HashableSynchronizedTable>()
     var marked = Set<HashableSynchronizedTable>()
     var result: [String: Int] = [:]
-    for table in tableDependencies.keys {
+    // Every table, not just those that turned up as a dependency key.
+    //
+    // `tableDependencies` only gains a key for a table with an *outgoing*
+    // foreign key, and a table is otherwise reached only by recursing into
+    // someone else's dependencies. So a table with no foreign keys in either
+    // direction — legitimate for anything referenced only by soft, unenforced
+    // columns — was silently absent from the result.
+    //
+    // That is not a cosmetic gap. Callers look their table up here and have
+    // to decide what a `nil` means, and the sort in
+    // `nextRecordZoneChangeBatch` decided it meant "order these arbitrarily",
+    // which is not a strict weak ordering and made `sort` undefined for the
+    // *whole* batch. On a real migration thirteen such records were enough to
+    // put 1,350 todos ahead of the 76 areas they depend on, and every todo
+    // then failed with `referenceViolation` against a parent that was never
+    // sent. Giving every table an index removes the question.
+    //
+    // Ordering is unchanged for tables that were already present: `visit` is
+    // idempotent through `visited`, and dependencies are still numbered
+    // before their dependents.
+    for table in tables.map(HashableSynchronizedTable.init) {
       try visit(table: table)
     }
     return result
