@@ -435,11 +435,15 @@
       defaultZone: defaultZone,
       privateTables: privateTables
     )
+    // A private table's records go to the user's own zone with no parent, so
+    // the parent's share can't make them unwritable: look up no parent.
+    let isPrivate = privateTables.contains { $0.base.tableName == Base.tableName }
+    let checkedParentPrimaryKey = isPrivate ? nil : parentRecordPrimaryKey
 
     return With {
       SyncMetadata
         .where {
-          $0.recordPrimaryKey.is(parentRecordPrimaryKey)
+          $0.recordPrimaryKey.is(checkedParentPrimaryKey)
             && $0.recordType.is(parentRecordType)
         }
         .select { RootShare.Columns(parentRecordName: $0.parentRecordName, share: $0.share) }

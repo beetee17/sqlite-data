@@ -12,6 +12,18 @@
   extension BaseCloudKitTests {
     @MainActor
     final class AssetsTests: BaseCloudKitTests, @unchecked Sendable {
+      /// Setting the same bytes again keeps the existing asset, so an unchanged file isn't
+      /// uploaded again when its record is rebuilt (as `setAsset` already does).
+      @Test func setBytesSkipsUnchangedBytes() {
+        let record = CKRecord(recordType: "remindersListAssets", recordID: CKRecord.ID(recordName: "1"))
+        #expect(record.setBytes(Array("image".utf8), forKey: "coverImage", at: 1))
+        let asset = record["coverImage"] as? CKAsset
+        #expect(!record.setBytes(Array("image".utf8), forKey: "coverImage", at: 2))
+        #expect((record["coverImage"] as? CKAsset) === asset)
+        #expect(record.setBytes(Array("other".utf8), forKey: "coverImage", at: 3))
+        #expect((record["coverImage"] as? CKAsset) !== asset)
+      }
+
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func basics() async throws {
         try await userDatabase.userWrite { db in

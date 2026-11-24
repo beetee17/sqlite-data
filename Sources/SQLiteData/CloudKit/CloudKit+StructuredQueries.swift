@@ -224,6 +224,8 @@
 
       @Dependency(\.dataManager) var dataManager
       let hash = newValue.sha256
+      // Unchanged bytes: keep the existing asset rather than upload it again.
+      guard encryptedValues[hash: key] != hash else { return false }
       let fileURL = dataManager.temporaryDirectory.appending(
         component:
           hash

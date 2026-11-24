@@ -265,7 +265,7 @@
                 WITH "rootShares" AS (
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"
-                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS ("old"."remindersListID")) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
+                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS (NULL)) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
                     UNION ALL
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"
@@ -677,7 +677,7 @@
                 WITH "rootShares" AS (
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"
-                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS ("new"."remindersListID")) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
+                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS (NULL)) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
                     UNION ALL
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"
@@ -975,7 +975,7 @@
                 WITH "rootShares" AS (
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"
-                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS ("new"."remindersListID")) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
+                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS (NULL)) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
                     UNION ALL
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"
@@ -1365,7 +1365,7 @@
                 WITH "rootShares" AS (
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"
-                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS ("new"."remindersListID")) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
+                  WHERE ((("sqlitedata_icloud_metadata"."recordPrimaryKey") IS (NULL)) AND (("sqlitedata_icloud_metadata"."recordType") IS ('remindersLists')))
                     UNION ALL
                   SELECT "sqlitedata_icloud_metadata"."parentRecordName" AS "parentRecordName", "sqlitedata_icloud_metadata"."share" AS "share"
                   FROM "sqlitedata_icloud_metadata"

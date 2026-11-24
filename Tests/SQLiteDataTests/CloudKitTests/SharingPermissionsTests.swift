@@ -12,6 +12,62 @@
   extension BaseCloudKitTests {
     @MainActor
     final class SharingPermissionsTests: BaseCloudKitTests, @unchecked Sendable {
+      /// A private table's row belongs to the user even when its parent is shared read-only: it
+      /// is stored in the user's own zone with no parent, so the share's permission doesn't apply.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func writePrivateRecordForReadOnlyRemindersList() async throws {
+        let externalZone = CKRecordZone(
+          zoneID: CKRecordZone.ID(
+            zoneName: "external.zone",
+            ownerName: "external.owner"
+          )
+        )
+        try await syncEngine.modifyRecordZones(scope: .shared, saving: [externalZone]).notify()
+
+        let remindersListRecord = CKRecord(
+          recordType: RemindersList.tableName,
+          recordID: RemindersList.recordID(for: 1, zoneID: externalZone.zoneID)
+        )
+        remindersListRecord.setValue(1, forKey: "id", at: now)
+        remindersListRecord.setValue("Personal", forKey: "title", at: now)
+        let share = CKShare(
+          rootRecord: remindersListRecord,
+          shareID: CKRecord.ID(
+            recordName: "share-\(remindersListRecord.recordID.recordName)",
+            zoneID: remindersListRecord.recordID.zoneID
+          )
+        )
+        share.publicPermission = .readOnly
+        share.currentUserParticipant?.permission = .readOnly
+
+        try await syncEngine
+          .acceptShare(
+            metadata: ShareMetadata(
+              containerIdentifier: container.containerIdentifier!,
+              hierarchicalRootRecordID: remindersListRecord.recordID,
+              rootRecord: remindersListRecord,
+              share: share
+            )
+          )
+
+        try await self.userDatabase.userWrite { db in
+          try db.seed {
+            RemindersListPrivate(remindersListID: 1, position: 1)
+          }
+          try RemindersListPrivate.find(1).update { $0.position = 2 }.execute(db)
+          try #expect(RemindersListPrivate.find(1).fetchOne(db)?.position == 2)
+          // The shared parent itself still can't be given children.
+          let error = #expect(throws: DatabaseError.self) {
+            try db.seed {
+              Reminder(id: 1, title: "Get milk", remindersListID: 1)
+            }
+          }
+          #expect(error?.message == SyncEngine.writePermissionError)
+        }
+        // Uploaded to the user's own zone.
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+      }
+
       /// Inserting record into shared record when user does not have permission should be rejected.
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func insertRecordInReadOnlyRemindersList() async throws {
